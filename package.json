@@ -1,0 +1,7 @@
+{
+  "name": "rbx-c2-relay",
+  "version": "1.0.0",
+  "main": "relay.js",
+  "scripts": { "start": "node relay.js" },
+  "dependencies": { "ws": "^8.18.0", "uuid": "^9.0.1" }
+}
